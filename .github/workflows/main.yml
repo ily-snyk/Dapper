@@ -1,23 +1,23 @@
-name: Main Build
+name: Main Build and Snyk Security
 
 on:
   pull_request:
   push:
     branches:
-    - main
+      - main
     paths:
-    - '*'
-    - '!/docs/*' # Don't run workflow when files are only in the /docs directory
+      - '*'
+      - '!/docs/*'  # skip if only docs changed
 
 jobs:
-  vm-job:
-    name: Ubuntu
+  build-and-test:
+    name: Ubuntu Build & Test
     runs-on: ubuntu-latest
     services:
       postgres:
         image: postgres
         ports:
-        - 5432/tcp
+          - 5432/tcp
         env:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
@@ -26,32 +26,99 @@ jobs:
       sqlserver:
         image: mcr.microsoft.com/mssql/server:2019-latest
         ports:
-        - 1433/tcp
+          - 1433/tcp
         env:
           ACCEPT_EULA: Y
           SA_PASSWORD: "Password."
       mysql:
         image: mysql
         ports:
-        - 3306/tcp
+          - 3306/tcp
         env:
           MYSQL_ROOT_PASSWORD: root
           MYSQL_DATABASE: test
+
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v1
-    - name: Setup dotnet
-      uses: actions/setup-dotnet@v4
-      with:
-        dotnet-version: '9.0.x'
-    - name: .NET Build
-      run: dotnet build Build.csproj -c Release /p:CI=true
-    - name: Dapper Tests
-      run: dotnet test tests/Dapper.Tests/Dapper.Tests.csproj -c Release --logger GitHubActions -p:CI=true -p:TestTfmsInParallel=false
-      env:
-        MySqlConnectionString: Server=localhost;Port=${{ job.services.mysql.ports[3306] }};Uid=root;Pwd=root;Database=test;Allow User Variables=true
-        OLEDBConnectionString: Provider=SQLOLEDB;Server=tcp:localhost,${{ job.services.sqlserver.ports[1433] }};Database=tempdb;User Id=sa;Password=Password.;
-        PostgesConnectionString: Server=localhost;Port=${{ job.services.postgres.ports[5432] }};Database=test;User Id=postgres;Password=postgres;
-        SqlServerConnectionString: Server=tcp:localhost,${{ job.services.sqlserver.ports[1433] }};Database=tempdb;User Id=sa;Password=Password.;
-    - name: .NET Lib Pack
-      run: dotnet pack Build.csproj --no-build -c Release /p:PackageOutputPath=%CD%\.nupkgs /p:CI=true
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Cache NuGet packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.nuget/packages
+          key: ${{ runner.os }}-nuget-${{ hashFiles('**/*.csproj') }}
+          restore-keys: |
+            ${{ runner.os }}-nuget-
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '9.0.x'
+
+      - name: Restore dependencies
+        run: dotnet restore
+
+      - name: .NET Build
+        run: dotnet build Build.csproj -c Release /p:CI=true
+
+      - name: Dapper Tests
+        run: dotnet test tests/Dapper.Tests/Dapper.Tests.csproj -c Release --logger GitHubActions -p:CI=true -p:TestTfmsInParallel=false
+        env:
+          MySqlConnectionString: Server=localhost;Port=${{ job.services.mysql.ports[3306] }};Uid=root;Pwd=root;Database=test;Allow User Variables=true
+          OLEDBConnectionString: Provider=SQLOLEDB;Server=tcp:localhost,${{ job.services.sqlserver.ports[1433] }};Database=tempdb;User Id=sa;Password=Password.;
+          PostgesConnectionString: Server=localhost;Port=${{ job.services.postgres.ports[5432] }};Database=test;User Id=postgres;Password=postgres;
+          SqlServerConnectionString: Server=tcp:localhost,${{ job.services.sqlserver.ports[1433] }};Database=tempdb;User Id=sa;Password=Password.;
+
+      - name: .NET Lib Pack
+        run: dotnet pack Build.csproj --no-build -c Release /p:PackageOutputPath=%CD%\.nupkgs /p:CI=true
+
+  snyk-security:
+    name: Snyk Security Scans
+    runs-on: ubuntu-latest
+    needs: build-and-test  # wait for build & tests to finish
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Cache NuGet packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.nuget/packages
+          key: ${{ runner.os }}-nuget-${{ hashFiles('**/*.csproj') }}
+          restore-keys: |
+            ${{ runner.os }}-nuget-
+
+      - name: Restore dependencies
+        run: dotnet restore
+
+      - name: Build the project
+        run: dotnet build --no-restore --configuration Release
+
+      - name: Install Snyk CLI
+        run: npm install -g snyk
+
+      - name: Snyk Open Source Test
+        uses: snyk/actions/dotnet@master
+        continue-on-error: true
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+
+      - name: Snyk Code Test
+        run: snyk code test --sarif-file-output=snyk-code.sarif || true
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+
+      - name: Upload SARIF to GitHub
+        uses: github/codeql-action/upload-sarif@v2
+        with:
+          sarif_file: snyk-code.sarif
+
+      - name: Snyk IaC Test
+        run: snyk iac test --report || true
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
